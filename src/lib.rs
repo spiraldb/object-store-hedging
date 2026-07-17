@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use object_store::{ObjectStore, path::Path};
+//! use object_store::{ObjectStore, ObjectStoreExt, path::Path};
 //! use object_store_hedging::{HedgedStore, HedgingConfig};
 //!
 //! // Wrap any ObjectStore with hedging
