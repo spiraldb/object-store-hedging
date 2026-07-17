@@ -5,7 +5,7 @@ authors = ["SpiralDB Authors <hello@spiraldb.com>"]
 repository = "https://github.com/spiraldb/object-store-hedging"
 readme = "README.md"
 keywords = ["object", "storage", "cloud"]
-version = "0.1.0"
+version = "0.2.0"
 license = "MIT OR Apache-2.0"
 edition = "2024"
 include = ["src/**/*.rs", "LICENSE-MIT", "LICENSE-APACHE", "Cargo.toml"]
@@ -16,11 +16,15 @@ all-features = true
 [dependencies]
 async-trait = "0.1"
 bytes = "1"
-futures = "0.3.31"
-object_store = { version = "0.13.1", default-features = false }
-parking_lot = "0.12.5"
-sketches-ddsketch = "0.3.0"
-tokio = { version = "1.49.0", features = ["time"], default-features = false }
+futures = "0.3"
+object_store = { version = "0.14", default-features = false }
+parking_lot = "0.12"
+sketches-ddsketch = "0.4.0"
+tokio = { version = "1.49.0", features = [
+  "time",
+  "macros",
+], default-features = false }
 
 [dev-dependencies]
-rstest = "0.18"
+rstest = "0.26"
+tokio = { version = "1", features = ["rt"] }
