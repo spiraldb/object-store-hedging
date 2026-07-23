@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use object_store::{ObjectStore, path::Path};
+//! use object_store::{ObjectStore, ObjectStoreExt, path::Path};
 //! use object_store_hedging::{HedgedStore, HedgingConfig};
 //!
 //! // Wrap any ObjectStore with hedging
@@ -125,25 +125,44 @@ impl<T: ObjectStore> ObjectStore for HedgedStore<T> {
                 .unwrap_or(self.config.warmup_delay)
         };
 
-        let f1 = async {
-            let t = Instant::now();
-            let r = self.inner.get_opts(location, options.clone()).await?;
-            Result::<_, object_store::Error>::Ok((r, t.elapsed()))
-        };
-        let f2 = async {
-            sleep(delay).await;
-            let t = Instant::now();
-            let r = self.inner.get_opts(location, options.clone()).await?;
-            Result::<_, object_store::Error>::Ok((r, t.elapsed()))
-        };
+        let primary_start = Instant::now();
+        let primary = self.inner.get_opts(location, options.clone());
+        tokio::pin!(primary);
 
+        tokio::select! {
+            biased;
+            r = &mut primary => {
+                let result = r?;
+                self.sketch
+                    .write()
+                    .add(primary_start.elapsed().as_secs_f64());
+                return Ok(result);
+            }
+            _ = sleep(delay) => {}
+        }
+
+        let hedge_start = Instant::now();
+        let hedge = self.inner.get_opts(location, options);
+        tokio::pin!(hedge);
+
+        // Once both requests are in flight, an error is provisional until the
+        // other request has also failed.
         let (result, time) = tokio::select! {
-            r = f1 => {
-                r?
-            }
-            r = f2 => {
-                r?
-            }
+            biased;
+            r = &mut primary => match r {
+                Ok(result) => (result, primary_start.elapsed()),
+                Err(_) => {
+                    let result = hedge.await?;
+                    (result, hedge_start.elapsed())
+                }
+            },
+            r = &mut hedge => match r {
+                Ok(result) => (result, hedge_start.elapsed()),
+                Err(_) => {
+                    let result = primary.await?;
+                    (result, primary_start.elapsed())
+                }
+            },
         };
 
         self.sketch.write().add(time.as_secs_f64());
@@ -210,6 +229,7 @@ impl<T: ObjectStore> ObjectStore for HedgedStore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::memory::InMemory;
     use rstest::*;
 
     /// Mock store with controllable delay
@@ -243,6 +263,88 @@ mod tests {
                 path: "mock".to_string(),
                 source: "mock response".into(),
             })
+        }
+
+        async fn put_opts(&self, _: &Path, _: PutPayload, _: PutOptions) -> Result<PutResult> {
+            unimplemented!()
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _: &Path,
+            _: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>> {
+            unimplemented!()
+        }
+
+        fn delete_stream(
+            &self,
+            _: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            unimplemented!()
+        }
+
+        fn list(&self, _: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+            unimplemented!()
+        }
+
+        async fn list_with_delimiter(&self, _: Option<&Path>) -> Result<ListResult> {
+            unimplemented!()
+        }
+
+        async fn copy_opts(&self, _: &Path, _: &Path, _: CopyOptions) -> Result<()> {
+            unimplemented!()
+        }
+    }
+
+    /// Mock store whose primary request succeeds after its hedge fails.
+    #[derive(Debug)]
+    struct FailingHedgeStore {
+        inner: InMemory,
+        call_count: AtomicUsize,
+    }
+
+    impl FailingHedgeStore {
+        async fn new() -> Self {
+            let inner = InMemory::new();
+            inner
+                .put_opts(
+                    &Path::from("test"),
+                    Bytes::from_static(b"ok").into(),
+                    PutOptions::default(),
+                )
+                .await
+                .unwrap();
+
+            Self {
+                inner,
+                call_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl std::fmt::Display for FailingHedgeStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailingHedgeStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for FailingHedgeStore {
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+            match self.call_count.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    self.inner.get_opts(location, options).await
+                }
+                _ => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    Err(object_store::Error::NotFound {
+                        path: "hedge".to_string(),
+                        source: "transient hedge failure".into(),
+                    })
+                }
+            }
         }
 
         async fn put_opts(&self, _: &Path, _: PutPayload, _: PutOptions) -> Result<PutResult> {
@@ -321,6 +423,23 @@ mod tests {
         // But since first also takes 500ms, whichever finishes first wins
         // Both should finish around same time (~500-510ms)
         assert!(elapsed < Duration::from_millis(600));
+        assert_eq!(store.inner.call_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_uses_primary_success_after_hedge_error() {
+        let config = HedgingConfig {
+            min_samples: 0,
+            quantile: 0.5,
+            warmup_delay: Duration::from_millis(10),
+        };
+        let store = HedgedStore::new(FailingHedgeStore::new().await, config);
+
+        let result = store
+            .get_opts(&Path::from("test"), GetOptions::default())
+            .await;
+
+        assert!(result.is_ok());
         assert_eq!(store.inner.call_count.load(Ordering::Relaxed), 2);
     }
 }
